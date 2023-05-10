@@ -22,6 +22,9 @@ except:
     WindowProcessReverse = None
     print("[Warning] Fused window process have not been installed. Please refer to get_started.md for installation.")
 
+from pytorch_quantization import quant_modules
+from pytorch_quantization import nn as quant_nn
+
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -88,9 +91,15 @@ class WindowAttention(nn.Module):
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
     """
 
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., quantize=False):
 
         super().__init__()
+        self.quantize = quantize
+        if self.quantize:
+            self.residual_quantizer_attn = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
+            self.residual_quantizer_q = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
+            self.residual_quantizer_k = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
+            self.residual_quantizer_v = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
         self.dim = dim
         self.window_size = window_size  # Wh, Ww
         self.num_heads = num_heads
@@ -133,7 +142,10 @@ class WindowAttention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
 
         q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
+        if self.quantize:
+            attn = (self.residual_quantizer_q(q) @ self.residual_quantizer_k(k.transpose(-2, -1)))
+        else:
+            attn = (q @ k.transpose(-2, -1))
 
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
@@ -148,6 +160,10 @@ class WindowAttention(nn.Module):
         else:
             attn = self.softmax(attn)
 
+        if self.quantize:
+            # (Softmax,Gather)->MatMul
+            v = self.residual_quantizer_v(v)
+            attn = self.residual_quantizer_attn(attn)
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
@@ -195,8 +211,11 @@ class SwinTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 fused_window_process=False):
+                 fused_window_process=False, quantize=False):
         super().__init__()
+        self.quantize = quantize
+        if self.quantize:
+            self.residual_quantizer = quant_nn.TensorQuantizer(quant_nn.QuantConv2d.default_quant_desc_input)
         self.dim = dim
         self.input_resolution = input_resolution
         self.num_heads = num_heads
@@ -212,7 +231,7 @@ class SwinTransformerBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
             dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, quantize=self.quantize)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -385,7 +404,7 @@ class BasicLayer(nn.Module):
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
-                 fused_window_process=False):
+                 fused_window_process=False, quantize=False):
 
         super().__init__()
         self.dim = dim
@@ -403,7 +422,8 @@ class BasicLayer(nn.Module):
                                  drop=drop, attn_drop=attn_drop,
                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                                  norm_layer=norm_layer,
-                                 fused_window_process=fused_window_process)
+                                 fused_window_process=fused_window_process,
+                                 quantize=quantize)
             for i in range(depth)])
 
         # patch merging layer
@@ -507,6 +527,7 @@ class SwinTransformer(nn.Module):
         patch_norm (bool): If True, add normalization after patch embedding. Default: True
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
         fused_window_process (bool, optional): If True, use one kernel to fused window shift & window partition for acceleration, similar for the reversed part. Default: False
+        quantize (bool, optional): If True, quantizes necessary additional branches (Conv and MatMul with 1 dynamic input are quantized automatically by the pytorch-quantization toolkit)..
     """
 
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
@@ -514,9 +535,9 @@ class SwinTransformer(nn.Module):
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 use_checkpoint=False, fused_window_process=False, **kwargs):
+                 use_checkpoint=False, fused_window_process=False, quantize=False, **kwargs):
         super().__init__()
-
+        self.quantize = quantize
         self.num_classes = num_classes
         self.num_layers = len(depths)
         self.embed_dim = embed_dim
@@ -559,7 +580,8 @@ class SwinTransformer(nn.Module):
                                norm_layer=norm_layer,
                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                                use_checkpoint=use_checkpoint,
-                               fused_window_process=fused_window_process)
+                               fused_window_process=fused_window_process,
+                               quantize=self.quantize)
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
